@@ -1,0 +1,554 @@
+---
+title: "A Note on User Session Definition"
+author: "Vladimir Ryzhov"
+date: "April 4, 2018"
+output:
+  html_document:
+      theme: united
+    #  code_folding: hide
+      highlight: tango
+      toc: false
+      # toc_float:
+      #   collapsed: true
+#        smooth_scroll: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+
+<!--- https://stackoverflow.com/questions/36845178/width-of-r-code-chunk-output-in-rmarkdown-files-knitr-ed-to-html -->
+<style>
+.main-container { width: 900px; max-width:1800px;}
+</style>
+
+
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width = 720)
+```
+
+
+```{r libraries, echo = FALSE, cache = FALSE}
+suppressPackageStartupMessages(library(ggplot2,quietly=TRUE))
+suppressPackageStartupMessages(library(data.table,quietly=TRUE))
+suppressPackageStartupMessages(library(scales,quietly=TRUE))
+suppressPackageStartupMessages(library(plotly,quietly=TRUE))
+
+```
+
+
+
+## Introduction
+
+
+User sessions are generally defined as time intervals when the user interacted 
+with the application separated by “long enough” periods of user inactivity.
+
+The session timeout is a parameter used to mark the end of active session. 
+In practice, its value is set according to the nature of application. 
+For instance, in the online banking the choice in motivated by security 
+concerns, whereas the session timeout in an online video game can be set to 
+a few seconds reflecting the longest disconnect time after which  the game 
+progression of affected players is deemed irrecoverable. In the context of 
+web usage the session timeout is typically defined 
+as 30 minutes of inactivity.
+
+Leaving aside cases involving judgement calls, is it possible to suggest 
+an appropriate session timeout based on the observed user behavior?
+Simply put, how long do we want to wait for the next click from the 
+recently active user before considering him “gone for today”? These 
+questions by their very nature are probabilistic with the answers 
+given in terms of probabilities of a user to come back
+after being inactive for some time. More accurately, the waiting
+time threshold after which the user is considered “gone” is determined 
+by the probability of the user’s return as a function of the elapsed time.
+
+
+The same problem exists in the marketing and retail industry. The problem 
+of customer churn can be reformulated as a question of probability of 
+customers making their next purchase. In contrast to the anonymous web 
+browsing, the answer to this question is typically much more involved 
+and includes analyses of the observed history of individual customers' 
+behavior. Differences in purchase patterns lead to the “session timeout”
+parameter being shorter for frequent buyers and longer for occasional ones.
+
+Marketing analogy is a reminder that in addition to the user dimension, 
+there exists the time dimension. Different behaviors during different time 
+periods should be expected.  Web usage slows down at night and the sales 
+volume increases during holiday seasons when the whole nation goes on a 
+shopping spree.
+
+Putting off discussions of more nuanced cases, is there a way to
+utilize observed usage data and devise a session definition that would 
+work equally well (or equally poorly) for all users and for all times?
+
+This post is an attempt to answer this question.
+
+## Main idea
+
+Suppose we have the usage data in the form of a log file with two fields: 
+$\bf{userID}$ and $\bf{timestamp}$ representing user interactions with the 
+application. Each value of the session timeout parameter $T > 0$ partitions
+this set into non-overlapping "sessions" defined as sequences of events
+separated by time intervals greater than $T$. Small values of $T$ lead to
+many short sessions and large values result in a few relatively long sessions.
+Two limiting cases of $T\rightarrow 0$ and $T \rightarrow +\infty$ correspond 
+to sessions that contain a single event and the sessions spanning the whole of
+users history. Somewhere  between these extreme cases lies the "useful" 
+value of $T$. 
+
+Define the session duration $d(T)$  as the time interval between the first 
+and the last events of a session. It is a random variable that depends on the 
+choice of parameter $T$. We will be looking for the "optimal" value of $T$
+that minimizes the variance of $d(T)$, or alternatively, maximizes 
+the information contained in the corresponding user sessions' durations. 
+$$
+T^* = \mathop{arg\; min}_{T>0} \mathop{Var}[d(T)]
+$$
+In other words, the session timeout $T^*$ results in the most homogeneous 
+set of durations of corresponding user sessions. 
+
+
+One important detail missing in the reasoning above are the “partial” sessions. 
+They exist because the user activity may get truncated at the start and end
+times of the sample.  The data used in the illustration below is truncated on
+both sides (left and right), meaning that some sessions might have started
+before the first observation and some might have ended after the last 
+observation. Ideally, we need to take data truncation into consideration and
+adjust the procedure either by ignoring incomplete sessions (each value of $T$ 
+produces different subset of observations to  drop), or by filling in
+the “missing” data using our knowledge of users activity. For the purposes 
+of this post, however, the issues caused by truncation are ignored. 
+This decision can be justified, at least partially, if the data represent 
+a time interval long enough filled with sufficiently complete user histories.
+
+
+
+## Data
+
+
+To demonstrate the idea we use a subset of data provided by the DOBBS study (see
+[DOBBS: Towards a Comprehensive Dataset to Study the Browsing Behavior 
+of Online Users](http://ieeexplore.ieee.org/document/6689993/) ). 
+
+```{r dataset,  cache = TRUE}
+# From http://practical-r.com/wp-content/uploads/2015/10/dobbsSessionEvents.zip
+dataFile <- "dobbsSessionEvents.dat"
+zipFile <- "dobbsSessionEvents.zip" 
+
+
+# Read file, select time and user_id. Convert time to POSIX time
+options(warn = -1)  # Suppress noninformative warnings from strptime
+pageViews.0 <- data.table(read.table(unz(zipFile, dataFile)))[
+    , .( user    = as.character(V3)
+     , timestamp = as.POSIXct(strptime(V1, "%Y%m%d%H%M%S")) )
+]
+options(warn = 0) 
+setkey(pageViews.0, user, timestamp )  # Order by user and timestamp
+
+# Compute between-event time
+pageViews.0[, time.diff := shift(as.numeric(timestamp), type = 'lead') 
+            - as.numeric(timestamp) , by = user]
+
+pageViews <- pageViews.0[is.na(time.diff) | time.diff > 0,] # remove duplicates
+
+pageViews[,`:=`(  page.view.no = 1:.N     # page view number       
+                , page.view.count = .N    # total page views
+), by = user]
+
+```
+
+It consists of `r nrow(pageViews.0)` log records 
+of `r length(unique(pageViews.0$user))` web users with associated page views
+(events) timestamps. 
+
+The chart below shows means and standard deviations of time intervals between 
+page views of each user. One dot represents a single user. The dot size 
+and color are mapped to the page views counts. 
+Both axes are on the logarithmic scale.
+```{r betweenViewsTimeStats, cache = TRUE}
+p1 <- ggplot(pageViews[!is.na(time.diff) , .(  mean = mean(time.diff)
+                                             , sd = sd( time.diff)
+                                             , median = median(time.diff)
+                        , N2 = (max(page.view.count))^0.5
+                        , page.views = max(page.view.count)
+                        ), by = user]
+  , aes(x = mean, y = sd, size = N2, colour = page.views ) ) + 
+  geom_point(alpha = 0.5) + 
+  xlab("mean, sec") + ylab("std.dev, sec") +
+  scale_x_log10() + scale_y_log10() + 
+  scale_colour_gradientn(colours = rev(rainbow(3))) +
+  theme_minimal() +
+    ggtitle("Means and Standard Deviations of between-events time intervals")
+ggplotly(p1, width = 900, height = 450, tooltip = c("x", "y","colour"))
+
+```
+The chart reveals linear relationship between the logarithms of means and 
+standard deviations. Notice the big difference between the scales of means and
+standard deviations typical for heavily skewed distributions. This is a good 
+sign as it suggests existence of large outliers among relatively short 
+between-events intervals representing the bulk of data. These outliers, these 
+long periods of inactivity, are indicators of presence of user sessions.
+There also appear to be at least three clusters in the data: users with 
+low page views and the between-views mean time of about 1 minute, users 
+with large count of page views (larger circles in the center of the chart) 
+and the rest.
+
+A more detailed analysis (not given here) suggests existence of four clusters. 
+They may correspond to  data collected from different web sites characterized
+by four distinct usage patterns. 
+
+
+
+## Sessions. Part 1
+
+The first and naive attempt to find the value of session timeout $T$ that
+minimizes variance of session duration fails. The duration function $d(T)$ 
+is monotone in $T$.
+
+This is easy to understand if we recall that when $T$ grows, the sessions 
+dataset  becomes smaller but the average session length increases
+since shorter sessions are merged together. 
+When $T \rightarrow 0$, the variance of session duration tends to zero with the 
+limiting case of one page view per session and as
+$T \rightarrow +\infty$, the variance tend to its maximal value. In the latter 
+case each user has a single session equal to the whole user's activity
+history.
+
+A suitable workaround is to consider an alternative measure of variance
+applicable to  positive random variables with the variance
+monotonically depending on the mean.
+Coefficient of Variation $CV(x)$ of the random variable $x$ is defined as the 
+ratio of the standard deviation of $x$ to its mean: $CV(x) = \sigma(x)/\mu(x)$ 
+In our case,  $x$ is the session duration $d(T)$.
+We will work with the robust version of $CV(x)$ defined as
+the ratio of the interquartile range to the
+median: $CVR = (Q_{3} - Q_{1})/Q_2$.
+It is to be minimized as a function of $T$ over the suitable range 
+of $T$ in order to find the optimal value $T^*$ of session timeout.
+$$
+T^* = \mathop{arg\; min}_{T>0} \mathop{CVR}[d(T)]
+$$
+
+The chart below shows $CVR[d(T)]$ for $T$ in the range from 1 minute to 24 
+hours with the step of 1 minute. We also plot the coefficient of variance 
+$CV(N)$ of the session length $N$ defined as the count of page views made 
+during  the session.
+
+```{r functions, cache = TRUE}
+
+createSessions <- function(data, session.timeout.sec)
+{
+  # creates sessions
+  # params: data,  session.timeout.sec
+  # returns data with additional fields indicating sessions
+  # 
+  data[, t.diff := as.numeric(timestamp) - shift(as.numeric(timestamp)
+                                                 , type = 'lag')
+       , by = user]
+  data[, session.start := ifelse(t.diff > session.timeout.sec 
+                                 | is.na(t.diff), 1, 0)]
+  data[, session.no := cumsum(session.start), by = user] # session number
+}
+
+sessionsStats <- function(data, upper.limit = 86400) 
+{
+   # goes over the range of parameter session.timeout.sec and 
+   # computes statitsics of correponding sessions
+   rbindlist(
+      lapply(seq(60, upper.limit, 60), function(x) {
+        createSessions(data,x)
+
+        d.duration <- data[!is.na(t.diff), .( session.duration = 
+                                                sum(t.diff, na.rm = TRUE)
+                                            , session.length = .N)
+                                      , by = .(user, session.no)]
+        d.stats <- d.duration[session.duration > 0
+                              , .(  m = mean(session.duration)
+                                  , s = sd(session.duration) 
+                                  , q25 = quantile(session.duration,0.25)
+                                  , q75 = quantile(session.duration,0.75)
+                                  , q50 = quantile(session.duration,0.5)
+                                  , m.log = mean(log(session.duration))
+                                  , s.log = sd(log(session.duration))
+                                  , n = mean(session.length)
+                                  , v = sd(session.length)
+                                 ) ]
+        d.stats$x <- x # add current value of session.timeout
+        d.stats
+      })
+  )    
+} 
+```
+
+```{r sessions.part.1,  cache = TRUE}
+# temporary data table
+d.tmp <- pageViews[, .(user, timestamp)]
+setkey(d.tmp, user, timestamp) # order by user, timestamp
+
+sessions.stats <- sessionsStats(d.tmp)
+sessions.stats[, `:=`(cv = s/m, qcd = (q75 - q25)/(q75 + q25)
+                      , iqr = q75 - q25, cv.log = s.log/m.log, cvn = v/n )]
+```
+
+```{r plot2, cache = TRUE}
+
+p2 <- ggplot(melt(sessions.stats[x <= 86400
+                              , .(T = x, `CVR(d)` = iqr/q50, `CV(N)` = cvn)]
+            , id.vars = "T", variable.name =  "Metric" )
+        , aes(x = T, y = value, color = Metric)) + xlab("T, sec") +
+  geom_line() + theme_minimal() + 
+  ggtitle("Variance measures of session length and duration")
+ggplotly(p2, width = 900, height = 450, tooltip = c("x", "y","colour"))
+
+```
+
+Both $CVR(d)$ and $CV(N)$ have minima at $T^* \approx 23000$ seconds 
+or $6$ hours $23$ minutes. 
+
+
+```{r bootstrap, echo = FALSE, cache = TRUE, eval = FALSE}
+users <- d.tmp[,unique(user)]
+nbUsers <- length(users)
+
+sessions.stats.boot <- data.table()
+
+for (b in 1:200) {
+  # sampel users with replacement
+  sampled.users <- data.table(user = users[sample(nbUsers,size = nbUsers
+                                , replace = TRUE )])
+  setkey(sampled.users, user)
+  sampled.users[, user.instance := 1:.N, by = user]
+  # sample their data making sure we have duplicates (cartesian = TRUE)
+  sampled.data <-  merge(d.tmp[,.(user, timestamp)]
+        , sampled.users, by="user", allow.cartesian = TRUE) 
+  # replace "user"" with user.instance to differentiate user's instances
+  sampled.data[, user := paste(user, user.instance, sep = '.') ] 
+  setkey(sampled.data, user, timestamp)  # sort
+  
+  sessions.stats.b <- sessionsStats(sampled.data)
+  sessions.stats.b[, `:=`(cv = s/m, qcd = (q75 - q25)/(q75 + q25)
+                      , iqr = q75 - q25, cv.log = s.log/m.log, cvn = v/n
+                      , r = b)]
+  
+  sessions.stats.boot  <- rbind(sessions.stats.boot,sessions.stats.b)
+  
+}   
+
+sessions.stats.boot[ , .(n = .N), by = r]
+
+timeout.boot <- do.call(rbind,
+  lapply(1:200, function(idx){
+    i.min <- which.min(sessions.stats.boot[r == idx, iqr/q50]) 
+    sessions.stats.boot[r == idx, ][i.min, x]
+  } )
+)
+
+
+quantile(timeout.boot,c(0.0275,0.5, 0.9725) )/3600
+#    2.75%      50%   97.25% 
+# 3.567208 6.183333 7.493958 
+mean(timeout.boot)/3600 # 6.036
+
+boxplot(timeout.boot/3600)
+hist(timeout.boot/3600)
+
+
+timeout.N.boot <- do.call(rbind,
+  lapply(1:200, function(idx){
+    i.min <- which.min(sessions.stats.boot[x > 15000,][ r == idx , cvn]) 
+    sessions.stats.boot[x > 15000, ][ r == idx, ][i.min, x]
+  } )
+)
+
+quantile(timeout.N.boot,c(0.0275,0.5, 0.9725) )/3600
+#    2.75%      50%   97.25% 
+# 5.533333 5.566667 6.691583 
+mean(timeout.N.boot)/3600 # 5.806333
+
+boxplot(timeout.N.boot/3600)
+hist(timeout.N.boot/3600)
+
+```
+Percentile bootstrap yields more accurate results for the session timeout
+parameter $T^*$ that minimizes $CVR(d)$ (note that we sample users, not 
+individual page views):
+$\mathop{median}(T^*_{boot}) = 22260$ seconds or $6$ hours $11$ minutes
+ with the $95\%$ confidence interval $[3.57, 7.49]$ hours. 
+For comparison, the same bootstrap schema for minimization of $CV(N)$ results 
+in $\mathop{median}(T^*_{boot}) = 20040$ seconds or $5$ hours $34$ minutes with the
+much tighter $95\%$ confidence interval $[5.53, 6.69]$ hours. 
+
+```{r solution,  cache = TRUE}
+
+sessions.solution <- createSessions(d.tmp, session.timeout.sec = 22260)
+
+stats.solution <- sessions.solution[, .( duration = sum(t.diff,na.rm = TRUE)
+                                        ,length = .N)
+                                    , by = .(user, session.no)]
+```
+
+
+Setting the session timeout to $T^* = \mathop{median}(T^*_{boot}) = 22260$ 
+seconds we obtain the median session duration
+`r round(median(stats.solution$duration)/3600,2)` 
+hours and the median count of page views `r median(stats.solution$length)`.
+
+
+## Sessions. Part 2
+
+
+The session timeout interval of $6$ hours with the median session of
+$24$ hours does not sound right from the common sense perspective. 
+Although these numbers may indicate a certain periodicity of 
+observed web usage, they are not practical for the session definition if the 
+session is understood as an uninterrupted stream of user's interactions 
+with the service. 
+
+Fortunately, it is not difficult to reconcile the data with our intuition. 
+Long session timeouts are results of the large time span of our data
+ranging from 
+`r as.Date(range(pageViews[,timestamp]))[1]` to 
+`r as.Date(range(pageViews[,timestamp]))[2]`. 
+
+The first idea to help the situation is to repeat the same procedure
+on a subset representing shorter time frame. This approach, however, implies 
+throwing away some valid data. Additionally, it is not immediately clear what time
+interval should be used. A better idea is to apply the same procedure
+but on shorter chunks, more precisely, on the sessions identified in the 
+previous section.  Put another way, we will consider sessions 
+corresponding the timeout $T^*$ obtained earlier as historical 
+web usage of independent users. Consequences of this "chopping" approach are 
+that all user identities and all seasonality patterns existing in the original
+data are ignored. This is consistent with the goal of analysis - the 
+definition of user activity sessions agnostic of the individual user
+differences and specifics of various time periods. 
+
+
+This idea produces the chart below. It shows the same variance metrics 
+$CVR(d)$ and $CV(N)$ that were used before.
+```{r sessions.part.2, cache = TRUE}
+d.tmp.2 <- copy(sessions.solution) 
+d.tmp.2[, user := paste(user, session.no, sep = '.')]
+setkey(d.tmp.2, user, timestamp)
+
+sessions.stats.2 <- sessionsStats(d.tmp.2, upper.limit = 18000)
+sessions.stats.2[, `:=`(cv = s/m, qcd = (q75 - q25)/(q75 + q25)
+                      , iqr = q75 - q25, cv.log = s.log/m.log, cvn = v/n )]
+
+session.timeout <- sessions.stats.2[x > 400, 
+                        ][which.min(sessions.stats.2[x > 400,  iqr/q50])  ,]$x
+
+sessions.solution.2 <- createSessions(d.tmp.2
+                                      , session.timeout.sec = session.timeout)
+
+stats.solution.2 <- sessions.solution.2[, .(duration = sum(t.diff,na.rm = TRUE)
+                                        ,length = .N)
+                                    , by = .(user, session.no)]
+
+formatTime <- function(x) {
+  y <- c(trunc(x) , round(60 * (x %% 1) ) )
+  paste0(y[1], " hours ", y[2], " minutes")
+}
+
+format.to <- formatTime(session.timeout/3600)
+format.median.duration <- formatTime(median(stats.solution.2$duration)/3600)
+
+```
+There is a clearly seen minimum of $CVR(d)$ 
+attained at the session timeout value of `r session.timeout` seconds, 
+or `r format.to`. The median 
+session duration then is `r format.median.duration`
+with the median count of page views `r median(stats.solution.2$length)`. 
+Note that in contrast with the results of previous section, $CV(N)$ does not 
+exhibit the same behavior as $CVR(d)$. 
+```{r plot3, cache = TRUE}
+
+p3 <- ggplot(melt(sessions.stats.2[x <= 18000
+                              , .(T = x, `CVR(d)` = iqr/q50, `CV(N)` = cvn)]
+            , id.vars = "T", variable.name =  "Metric" )
+        , aes(x = T, y = value, color = Metric)) + xlab("T, sec") +
+  geom_line() + theme_minimal() + 
+  ggtitle("Variance measures of session length and duration") 
+ggplotly(p3, width = 900, height = 450, tooltip = c("x", "y","colour"))
+
+```
+
+The session timeout value of `r format.to`, or roughly $60$ minutes
+is reasonable and could be used for the definition of activity 
+sessions. 
+
+It is worth mentioning that 
+obtained results favor active users with many data points and play
+down the role of less active visitors. When this imbalance is not desired 
+appropriate weights can be assigned to each user's data in order to level off
+individual's contributions to the variance of session duration $d[T]$. 
+
+
+Finally, the chart below shows the session breakdown for a small sample of 
+users corresponding to the session timeout parameter of `r format.to` 
+found above. The first event of each session is shown in black. 
+
+```{r sessions.sample, echo = FALSE, cache = TRUE}
+active.users <- sessions.solution[, .( E = .N, N = max(session.no)
+                                       , D = min(as.Date(timestamp)) )
+                                  , by = .(user)
+                            ][ D >= as.Date('2013-07-31')
+                               & D <= as.Date('2013-08-01'), user] 
+
+
+
+active.users.sample <- 
+  unique(do.call(rbind,strsplit(active.users, "[.]") )[,1] )[-c(2,5,7,12)]
+
+active.users.sessions <-
+    createSessions(  sessions.solution[user %in% active.users.sample, ] 
+                   , session.timeout.sec = session.timeout)
+
+setkey(active.users.sessions, user, timestamp)
+active.users.sessions[, event.no := 1:.N , by = user  ]
+
+plot.data <- active.users.sessions[as.Date(timestamp) < as.Date('2013-08-06'),]
+plot.data[, user.number :=  frank(user, ties.method = "dense") ]
+plot.data[, user.name := paste('User', user.number )]
+
+
+p4 <- ggplot(plot.data, aes(x = timestamp, y = user.number, color=user.name)) + 
+    geom_errorbar(data = plot.data
+                , mapping = aes(x = timestamp, ymin = user.number - 0.1
+                                , ymax = user.number + 0.1)
+                , size = 0.1, alpha = 0.8 ) + 
+  geom_errorbar(data = plot.data[ session.start == 1, ]
+                , mapping = aes(x = timestamp, ymin = user.number - 0.11
+                                , ymax = user.number + 0.11)
+                , color="black", size = 0.1, alpha = 1 ) + 
+  scale_y_continuous(breaks=1:10) + 
+  theme_minimal() +
+   theme(  legend.position="none"
+        , strip.background = element_blank()
+        , strip.text.x = element_blank()) + ylab("User") + xlab("Time") + 
+  ggtitle(paste0("Sample of user sessions for session timeout "
+          , formatTime(session.timeout/3600)) )
+
+ ggplotly(p4, width = 900, height = 500, tooltip = c("x", "y","colour"))
+
+
+```
+
+
+## Final remarks 
+
+Data-driven definition of user sessions proposed in this article is not a
+recipe to be followed blindly. Metrics that happen to be useful in our case 
+are not necessarily the best option in other situations. The data set chosen 
+for the demonstration appears to be a mixture of few components derived 
+from the log files of several web sites with different usage patterns. 
+This situation is not typical in practice when the session definition is 
+devised within the context of a specific service or application. Other
+variance metrics may prove useful in these more homogeneous situations.
+It also may be beneficial to introduce multiple session timeout parameters 
+to facilitate individual categories of users sharing the same activity 
+patterns.
+
